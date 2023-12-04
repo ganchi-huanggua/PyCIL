@@ -53,6 +53,9 @@ def _train(args):
         args["seed"],
         args["init_cls"],
         args["increment"],
+        args["semi_supervised_mode"],
+        args["labeled_ratio"],
+        args["unlabeled_data_distribution_mode"]
     )
     model = factory.get_model(args["model_name"], args)
 

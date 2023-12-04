@@ -7,7 +7,8 @@ from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000
 from tqdm import tqdm
 
 class DataManager(object):
-    def __init__(self, dataset_name, shuffle, seed, init_cls, increment):
+    def __init__(self, dataset_name, shuffle, seed, init_cls, increment,
+                 semi_supervised_mode, labeled_ratio, unlabeled_data_distribution_mode):
         self.dataset_name = dataset_name
         self._setup_data(dataset_name, shuffle, seed)
         assert init_cls <= len(self._class_order), "No enough classes."
@@ -17,6 +18,10 @@ class DataManager(object):
         offset = len(self._class_order) - sum(self._increments)
         if offset > 0:
             self._increments.append(offset)
+
+        self.semi_supervised_mode = semi_supervised_mode
+        self.labeled_ratio = labeled_ratio
+        self.unlabeled_data_distribution_mode = unlabeled_data_distribution_mode
 
     @property
     def nb_tasks(self):
@@ -56,31 +61,39 @@ class DataManager(object):
         else:
             raise ValueError("Unknown mode {}.".format(mode))
 
+            # modify from here
         data, targets = [], []
-        for idx in indices:
-            if m_rate is None:
-                class_data, class_targets = self._select(
-                    x, y, low_range=idx, high_range=idx + 1
-                )
-            else:
-                class_data, class_targets = self._select_rmm(
-                    x, y, low_range=idx, high_range=idx + 1, m_rate=m_rate
-                )
-            data.append(class_data)
-            targets.append(class_targets)
+        train_unlabeled_data = []
+        # class indices (no other information, just [0, 10]...)
+        # and it represents the label (we just mapped, not truth from the original datasets) [0, 10]
+        if not self.semi_supervised_mode:
+            for idx in indices:
+                if m_rate is None:
+                    class_data, class_targets = self._select(
+                        x, y, low_range=idx, high_range=idx + 1
+                    )
+                else:
+                    class_data, class_targets = self._select_rmm(
+                        x, y, low_range=idx, high_range=idx + 1, m_rate=m_rate
+                    )
+                data.append(class_data)
+                targets.append(class_targets)
+            if appendent is not None and len(appendent) != 0:
+                appendent_data, appendent_targets = appendent
+                data.append(appendent_data)
+                targets.append(appendent_targets)
+            data, targets = np.concatenate(data), np.concatenate(targets)
 
-        if appendent is not None and len(appendent) != 0:
-            appendent_data, appendent_targets = appendent
-            data.append(appendent_data)
-            targets.append(appendent_targets)
-
-        data, targets = np.concatenate(data), np.concatenate(targets)
-
+        else:
+            data, targets, train_unlabeled_data = self._split_labeled_and_unlabeled(x, y, indices,
+                                                                                    self.labeled_ratio,
+                                                                                    self.distribution_mode)
         if ret_data:
-            return data, targets, DummyDataset(data, targets, trsf, self.use_path)
+            return data, targets, train_unlabeled_data, DummyDataset(data, targets, trsf, self.use_path,
+                                                                     train_unlabeled_data)
         else:
             return DummyDataset(data, targets, trsf, self.use_path)
-
+        # modify to here
         
     def get_finetune_dataset(self,known_classes,total_classes,source,mode,appendent,type="ratio"):
         if source == 'train':
@@ -241,14 +254,71 @@ class DataManager(object):
         y = self._train_targets
         return np.sum(np.where(y == index))
 
+    def _split_labeled_and_unlabeled(self, x, y, indices, ratio, distribution_mode):
+        labeled_data, label, unlabeled_data = [], [], []
+        if distribution_mode == "no_ood":
+            for idx in indices:
+                class_labeled_data, class_label, class_unlabeled_data = \
+                    self._select_labeled_and_unlabeled(x, y, idx, ratio)
+
+                labeled_data.append(class_labeled_data)
+                label.append(class_label)
+                unlabeled_data.append(class_unlabeled_data)
+
+            labeled_data = np.concatenate(labeled_data)
+            label = np.concatenate(label)
+            unlabeled_data = np.concatenate(unlabeled_data)
+
+        else:
+            for idx in indices:
+                class_labeled_data, class_label = self._select_rmm(x, y, idx, idx + 1, ratio)
+                labeled_data.append(class_labeled_data)
+                label.append(class_label)
+            labeled_data = np.concatenate(labeled_data)
+            label = np.concatenate(label)
+
+            if distribution_mode == "ood_from_previous":
+                for idx in range(0, indices[0]):
+                    class_unlabeled_data, _ = self._select_rmm(x, y, idx, idx + 1, (1 - ratio) / len(range(0, indices[0])))
+                    unlabeled_data.append(class_unlabeled_data)
+                unlabeled_data = np.concatenate(unlabeled_data)
+
+            elif distribution_mode == "ood_from_future":
+                for idx in range(indices[-1], len(self._class_order)):
+                    class_unlabeled_data, _ = self._select_rmm(x, y, idx, idx + 1, (1 - ratio) / len(range(indices[-1], len(self._class_order))))
+                    unlabeled_data.append(class_unlabeled_data)
+                unlabeled_data = np.concatenate(unlabeled_data)
+
+            elif distribution_mode == "ood_random":
+                for idx in range(0, len(self._class_order)):
+                    class_unlabeled_data, _ = self._select_rmm(x, y, idx, idx + 1, (1 - ratio) / self._class_order)
+                    unlabeled_data.append(class_unlabeled_data)
+                unlabeled_data = np.concatenate(unlabeled_data)
+            else:
+                raise NotImplementedError("Unknown ood distribution {}.".format(distribution_mode))
+        return labeled_data, label, unlabeled_data
+
+    def _select_labeled_and_unlabeled(self, x, y, class_idx, ratio):
+        assert ratio is not None
+        if ratio != 0:
+            idxes = np.where(y == class_idx)[0]
+            idx_idxes = np.random.randint(
+                0, len(idxes), size=int(ratio * len(idxes))
+            )
+            labeled_idxes = idxes[idx_idxes]
+            labeled_idxes = np.sort(labeled_idxes)
+            unlabeled_idxes = [x for x in idxes if x not in labeled_idxes]
+            return x[labeled_idxes], y[labeled_idxes], x[unlabeled_idxes]
+
 
 class DummyDataset(Dataset):
-    def __init__(self, images, labels, trsf, use_path=False):
+    def __init__(self, images, labels, trsf, use_path=False, unlabeled_images=None):
         assert len(images) == len(labels), "Data size error!"
         self.images = images
         self.labels = labels
         self.trsf = trsf
         self.use_path = use_path
+        self.unlabeled_images = unlabeled_images
 
     def __len__(self):
         return len(self.images)
